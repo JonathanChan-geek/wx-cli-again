@@ -18,8 +18,8 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
 use super::{
-    collect_db_salts, is_writable_readable_page, match_raw_keys, scan_key_patterns, KeyEntry,
-    MAX_PATTERN_BYTES,
+    collect_db_salts, collect_salt_adjacent_keys, decode_salt_hex, is_writable_readable_page,
+    match_key_hexes, scan_key_patterns, KeyEntry, MAX_PATTERN_BYTES,
 };
 
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
@@ -70,27 +70,42 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     let db_salts = collect_db_salts(db_dir);
     eprintln!("找到 {} 个加密数据库", db_salts.len());
 
+    // 收集 salt 的二进制形式，供 salt 邻接扫描使用。
+    let salts: Vec<[u8; 16]> = db_salts
+        .iter()
+        .filter_map(|(s, _)| decode_salt_hex(s))
+        .collect();
+
     eprintln!("扫描进程内存...");
-    let raw_keys = scan_memory(process)?;
-    eprintln!("找到 {} 个候选密钥", raw_keys.len());
+    let (raw_keys, extra_keys) = scan_memory(process, &salts)?;
+    eprintln!(
+        "找到 {} 个候选密钥（字符串模式）+ {} 个 salt 邻接候选",
+        raw_keys.len(),
+        extra_keys.len()
+    );
 
     // SAFETY: 关闭进程句柄
     unsafe {
         let _ = CloseHandle(process);
     }
 
-    let entries = match_raw_keys(db_dir, &raw_keys, &db_salts);
+    let entries = match_key_hexes(db_dir, &extra_keys, &raw_keys, &db_salts);
     eprintln!(
         "匹配到 {}/{} 个数据库密钥（来自 {} 个候选 key）",
         entries.len(),
         db_salts.len(),
-        raw_keys.len()
+        raw_keys.len() + extra_keys.len()
     );
     Ok(entries)
 }
 
-fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
+fn scan_memory(
+    process: HANDLE,
+    salts: &[[u8; 16]],
+) -> Result<(Vec<(String, String)>, Vec<String>)> {
     let mut results: Vec<(String, String)> = Vec::new();
+    let mut extra_keys: Vec<String> = Vec::new();
+    let mut seen_extra = std::collections::HashSet::new();
     let mut addr: usize = 0;
 
     loop {
@@ -114,7 +129,15 @@ fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
         // 只扫描已提交的可读可写页面（含 WRITECOPY / EXECUTE_*WRITE*；见
         // `is_writable_readable_page`，从 old-main #54 捞回）。
         if mbi.State == MEM_COMMIT && is_writable_readable_page(mbi.Protect.0) {
-            scan_region(process, base, region_size, &mut results);
+            scan_region(
+                process,
+                base,
+                region_size,
+                &mut results,
+                salts,
+                &mut extra_keys,
+                &mut seen_extra,
+            );
         }
 
         addr = base.saturating_add(region_size);
@@ -123,10 +146,19 @@ fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
         }
     }
 
-    Ok(results)
+    Ok((results, extra_keys))
 }
 
-fn scan_region(process: HANDLE, base: usize, size: usize, results: &mut Vec<(String, String)>) {
+#[allow(clippy::too_many_arguments)]
+fn scan_region(
+    process: HANDLE,
+    base: usize,
+    size: usize,
+    results: &mut Vec<(String, String)>,
+    salts: &[[u8; 16]],
+    extra_keys: &mut Vec<String>,
+    seen_extra: &mut std::collections::HashSet<String>,
+) {
     let overlap = MAX_PATTERN_BYTES;
     let mut offset = 0usize;
 
@@ -154,6 +186,9 @@ fn scan_region(process: HANDLE, base: usize, size: usize, results: &mut Vec<(Str
         if ok && bytes_read > 0 {
             buf.truncate(bytes_read);
             search_pattern(&buf, results);
+            // 微信 4.x 的 key 常常只以「key || salt」二进制形式存在堆上，
+            // 不一定是 x'<hex>' 字符串；补一条 salt 邻接扫描路径。
+            collect_salt_adjacent_keys(&buf, salts, extra_keys, seen_extra);
         }
 
         if chunk_size > overlap {
