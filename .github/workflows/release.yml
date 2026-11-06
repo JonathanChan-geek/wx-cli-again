@@ -18,6 +18,11 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
+      - name: Install OpenSSL dev (Linux)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y pkg-config libssl-dev
+
       - name: cargo check linux target
         run: cargo check --target x86_64-unknown-linux-gnu
 
@@ -69,6 +74,29 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      # vendored-openssl 在 Windows 上要从源码编 OpenSSL，需要 perl + nmake。
+      # windows-latest 预装 Strawberry Perl（C:\Strawberry\perl\bin）和 MSVC 的
+      # nmake，但 PATH 里还可能有 Git 自带的 msys perl；msys perl 会让
+      # Configure 以 0xc0000142 失败，因此显式把 Strawberry 的两个 bin 目录
+      # prepend 到 GITHUB_PATH，确保 openssl-sys 抓到的是原生 perl。
+      - name: Prepare OpenSSL build env (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $candidates = @("C:\Strawberry\c\bin", "C:\Strawberry\perl\bin")
+          $dirs = @($candidates | Where-Object { Test-Path $_ })
+          if ($dirs.Count -eq 0) {
+            Write-Host "::error::Strawberry Perl not found; vendored OpenSSL build requires a native perl"
+            exit 1
+          }
+          foreach ($d in $dirs) {
+            $d | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "prepended to PATH: $d"
+          }
+          # 确认抓住的是原生 perl 而不是 msys perl
+          $perlExe = Join-Path "C:\Strawberry\perl\bin" "perl.exe"
+          if (Test-Path $perlExe) { & $perlExe -v }
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -80,7 +108,7 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Copy binary (Unix)
         if: matrix.os != 'windows-latest'

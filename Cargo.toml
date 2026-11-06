@@ -13,6 +13,13 @@ readme = "README.md"
 name = "wx"
 path = "src/main.rs"
 
+[features]
+# 默认链接系统 OpenSSL：本地开发不必从源码编整套 OpenSSL。
+# 发布二进制必须自带 OpenSSL（npm 分发单个可执行文件，不能要求用户装 DLL），
+# 因此 CI 打 tag 时用 --features vendored-openssl 覆盖。
+default = []
+vendored-openssl = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
